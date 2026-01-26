@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bookcut"
+version = "0.1.0"
+description = "CLI tool to search and download books using ISBN lookup"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [
+    { name = "Kartik Karia" }
+]
+keywords = ["books", "ebooks", "download", "cli", "isbn"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+    "lxml>=5.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kartikkaria/bookcut"
+Repository = "https://github.com/kartikkaria/bookcut"
+
+[project.scripts]
+bookcut = "bookcut.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bookcut"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/bookcut",
+    "/README.md",
+    "/LICENSE",
+]
