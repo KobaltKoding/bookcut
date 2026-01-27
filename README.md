@@ -16,6 +16,22 @@ cd bookcut
 pip install -e .
 ```
 
+For a global CLI install that automatically handles PATH:
+
+```bash
+pipx install .
+```
+
+### Fallback invocation
+
+If the `bookcut` command isn't found after installation (e.g. `~/.local/bin` is not on your PATH), you can always run:
+
+```bash
+python -m bookcut
+```
+
+> **Tip:** Using a virtual environment (`python -m venv .venv && source .venv/bin/activate`) before `pip install -e .` avoids PATH issues entirely.
+
 ### Requirements
 
 - Python 3.9+

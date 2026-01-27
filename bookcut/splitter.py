@@ -271,12 +271,7 @@ def classify_and_organize(
 
 def check_epub2md_installed() -> bool:
     """Check if epub2md CLI is installed."""
-    result = subprocess.run(
-        ["which", "epub2md"],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
+    return shutil.which("epub2md") is not None
 
 
 def split_epub_to_markdown(
