@@ -14,7 +14,7 @@ from rich.table import Table
 
 from bookcut.database import Database, LibraryBook
 from bookcut.sources import BookFinder
-import httpx
+from bookcut.splitter import split_epub_to_markdown, list_chapters, SplitterError
 
 app = typer.Typer(
     name="bookcut",
@@ -25,6 +25,7 @@ console = Console()
 
 _download_dir = Path.home() / "BookCut"
 _download_dir.mkdir(exist_ok=True)
+_markdown_dir = _download_dir / "markdown"
 _db = Database(_download_dir / "library.db")
 
 
@@ -73,7 +74,11 @@ def get(
 
     with BookFinder() as finder:
         try:
-            metadata, download = finder.find_book_and_download(query, on_status=status_callback)
+            metadata, download, filepath = finder.find_book_and_download(
+                query,
+                download_dir=_download_dir,
+                on_status=status_callback,
+            )
         except Exception as e:
             console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(1)
@@ -82,48 +87,13 @@ def get(
             console.print("[yellow]No book found matching your query.[/yellow]")
             raise typer.Exit(0)
 
-        if not download:
+        if not download or not filepath:
             console.print(f"\n[yellow]Found book but no download available:[/yellow]")
             console.print(f"  Title: {metadata.title}")
             console.print(f"  Author: {metadata.author or 'Unknown'}")
             if metadata.isbn:
                 console.print(f"  ISBN: {metadata.isbn}")
             raise typer.Exit(1)
-
-        console.print(f"\n[green]Found downloadable copy![/green]")
-        console.print(f"  Title: {download.title}")
-        console.print(f"  Author: {download.author or 'Unknown'}")
-        console.print(f"  Format: {download.format.upper()}")
-
-        # Create proper filename
-        author = download.author or metadata.author or "Unknown"
-        filename = _make_filename(download.title, author, download.format)
-        filepath = _download_dir / filename
-
-        # Handle duplicate filenames
-        counter = 1
-        base_filepath = filepath
-        while filepath.exists():
-            stem = base_filepath.stem
-            filepath = _download_dir / f"{stem} ({counter}).{download.format}"
-            counter += 1
-
-        console.print(f"\n[dim]Downloading to: {filename}[/dim]")
-
-        # Download the file
-        client = httpx.Client(
-            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
-            timeout=60.0,
-            follow_redirects=True,
-        )
-        try:
-            with client.stream("GET", download.download_url) as resp:
-                resp.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in resp.iter_bytes():
-                        f.write(chunk)
-        finally:
-            client.close()
 
     # Add to library (generate a pseudo-MD5 from ISBN or title)
     import hashlib
@@ -353,6 +323,141 @@ def remove(
 
     _db.remove_book(md5)
     console.print(f"[green]Removed:[/green] {book.title}")
+
+
+def _find_book_by_id(book_id: str) -> LibraryBook | None:
+    """Find a book by exact or partial MD5 match."""
+    book = _db.get_book(book_id)
+    if book:
+        return book
+
+    # Try partial match
+    all_books = _db.get_all_books()
+    matches = [b for b in all_books if b.md5.startswith(book_id)]
+
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        return None  # Ambiguous
+
+    return None
+
+
+@app.command()
+def split(
+    book_id: str = typer.Argument(..., help="Book ID from library or path to EPUB file"),
+) -> None:
+    """Split an EPUB into chapter-wise markdown files."""
+    # Check if it's a file path
+    if book_id.endswith(".epub") or "/" in book_id:
+        epub_path = Path(book_id).expanduser().resolve()
+        if not epub_path.exists():
+            console.print(f"[red]File not found:[/red] {epub_path}")
+            raise typer.Exit(1)
+        book_title = epub_path.stem
+    else:
+        # Look up in library
+        book = _find_book_by_id(book_id)
+        if not book:
+            all_books = _db.get_all_books()
+            matches = [b for b in all_books if b.md5.startswith(book_id)]
+            if len(matches) > 1:
+                console.print("[yellow]Multiple matches found. Be more specific:[/yellow]")
+                for b in matches:
+                    console.print(f"  {b.md5[:10]}... - {b.title}")
+                raise typer.Exit(1)
+            console.print("[red]Book not found in library.[/red]")
+            raise typer.Exit(1)
+
+        epub_path = Path(book.file_path)
+        book_title = book.title
+
+        if not epub_path.exists():
+            console.print(f"[red]File not found:[/red] {epub_path}")
+            raise typer.Exit(1)
+
+        if book.format and book.format.lower() != "epub":
+            console.print(f"[red]Not an EPUB file:[/red] {book.format.upper()}")
+            console.print("[dim]Only EPUB files can be split into markdown.[/dim]")
+            raise typer.Exit(1)
+
+    console.print(f"\n[bold]Splitting:[/bold] {book_title}\n")
+
+    def status_callback(msg: str):
+        console.print(f"[dim]{msg}[/dim]")
+
+    try:
+        output_path = split_epub_to_markdown(
+            epub_path,
+            _markdown_dir,
+            on_status=status_callback,
+        )
+    except SplitterError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    # List chapters
+    chapters = list_chapters(output_path)
+
+    console.print(f"\n[green]Split complete![/green]")
+    console.print(f"[dim]Output: {output_path}[/dim]\n")
+
+    # Show chapter list
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Chapter", width=50)
+    table.add_column("Size", width=10)
+
+    for ch in chapters:
+        size_kb = ch["size"] / 1024
+        table.add_row(
+            str(ch["number"]).zfill(2),
+            _truncate(ch["name"], 48),
+            f"{size_kb:.1f} KB",
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]{len(chapters)} chapter(s) created[/dim]\n")
+
+
+@app.command()
+def chapters(
+    book_id: str = typer.Argument(..., help="Book ID from library"),
+) -> None:
+    """List chapters for a split book."""
+    book = _find_book_by_id(book_id)
+    if not book:
+        console.print("[red]Book not found in library.[/red]")
+        raise typer.Exit(1)
+
+    # Check if markdown folder exists
+    epub_path = Path(book.file_path)
+    markdown_path = _markdown_dir / epub_path.stem
+
+    if not markdown_path.exists():
+        console.print(f"[yellow]Book has not been split yet.[/yellow]")
+        console.print(f"[dim]Run: bookcut split {book_id}[/dim]")
+        raise typer.Exit(1)
+
+    chapters = list_chapters(markdown_path)
+
+    console.print(f"\n[bold]{book.title}[/bold]\n")
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Chapter", width=50)
+    table.add_column("Size", width=10)
+
+    for ch in chapters:
+        size_kb = ch["size"] / 1024
+        table.add_row(
+            str(ch["number"]).zfill(2),
+            _truncate(ch["name"], 48),
+            f"{size_kb:.1f} KB",
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]{len(chapters)} chapter(s) in {markdown_path}[/dim]\n")
 
 
 if __name__ == "__main__":

@@ -3,11 +3,73 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote_plus
 
 import httpx
 from bs4 import BeautifulSoup
+
+
+# === Download Helper ===
+
+
+def download_file(
+    url: str,
+    filepath: Path,
+    on_status=None,
+    timeout: float = 120.0,
+) -> bool:
+    """
+    Download file from URL. Returns True on success, False on failure.
+    Handles network errors gracefully for waterfall retry.
+    """
+    client = httpx.Client(
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        },
+        timeout=timeout,
+        follow_redirects=True,
+    )
+
+    try:
+        with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with open(filepath, "wb") as f:
+                for chunk in resp.iter_bytes():
+                    f.write(chunk)
+        return True
+    except httpx.RemoteProtocolError as e:
+        if on_status:
+            on_status(f"  Download interrupted: {e}")
+        # Clean up partial file
+        if filepath.exists():
+            filepath.unlink()
+        return False
+    except httpx.TimeoutException as e:
+        if on_status:
+            on_status(f"  Download timed out: {e}")
+        if filepath.exists():
+            filepath.unlink()
+        return False
+    except httpx.HTTPStatusError as e:
+        if on_status:
+            on_status(f"  HTTP error: {e.response.status_code}")
+        if filepath.exists():
+            filepath.unlink()
+        return False
+    except Exception as e:
+        if on_status:
+            on_status(f"  Download failed: {e}")
+        if filepath.exists():
+            filepath.unlink()
+        return False
+    finally:
+        client.close()
 
 
 @dataclass
@@ -602,9 +664,20 @@ class BookFinder:
         return best
 
     def find_book_and_download(
-        self, query: str, on_status=None
-    ) -> tuple[BookMetadata | None, DownloadableBook | None]:
-        """Search for a book and find a download source using waterfall approach."""
+        self,
+        query: str,
+        download_dir: Path | None = None,
+        on_status=None,
+    ) -> tuple[BookMetadata | None, DownloadableBook | None, Path | None]:
+        """
+        Search for a book and download it using waterfall approach.
+
+        If download_dir is provided, actually downloads the file and retries
+        on failure with the next ISBN. Returns (metadata, download_info, filepath).
+
+        If download_dir is None, just finds download info without downloading.
+        Returns (metadata, download_info, None).
+        """
         if on_status:
             on_status("Phase 1: Collecting ISBNs from metadata sources...")
 
@@ -613,7 +686,7 @@ class BookFinder:
         if not metadata:
             if on_status:
                 on_status("No book metadata found.")
-            return None, None
+            return None, None, None
 
         if on_status:
             on_status(f"\nFound book: {metadata.title}")
@@ -632,15 +705,77 @@ class BookFinder:
                 download = self.find_download_by_isbn(isbn, expected_title=metadata.title, on_status=on_status)
                 if download:
                     download.isbn = isbn
-                    return metadata, download
+
+                    # If no download_dir, just return the download info
+                    if download_dir is None:
+                        return metadata, download, None
+
+                    # Attempt actual download
+                    filepath = self._attempt_download(download, metadata, download_dir, on_status)
+                    if filepath:
+                        return metadata, download, filepath
+                    else:
+                        if on_status:
+                            on_status(f"  Trying next ISBN...")
+                        continue
 
         if on_status:
             on_status("\nPhase 3: Falling back to title search...")
 
         download = self.find_download_by_title(metadata.title, metadata.author, on_status)
         if download:
-            return metadata, download
+            if download_dir is None:
+                return metadata, download, None
+
+            filepath = self._attempt_download(download, metadata, download_dir, on_status)
+            if filepath:
+                return metadata, download, filepath
 
         if on_status:
             on_status("No download found.")
-        return metadata, None
+        return metadata, None, None
+
+    def _attempt_download(
+        self,
+        download: DownloadableBook,
+        metadata: BookMetadata,
+        download_dir: Path,
+        on_status=None,
+    ) -> Path | None:
+        """Attempt to download a file. Returns filepath on success, None on failure."""
+        import re
+
+        def sanitize(s: str) -> str:
+            return re.sub(r'[/\\:*?"<>|]', "", s).strip()
+
+        # Create filename
+        title = sanitize(download.title)
+        author = sanitize(download.author or metadata.author or "Unknown")
+
+        if author and author.lower() != "unknown":
+            name = f"{title} - {author}"
+        else:
+            name = title
+
+        if len(name) > 200:
+            name = name[:200].rsplit(" ", 1)[0]
+
+        filename = f"{name}.{download.format}"
+        filepath = download_dir / filename
+
+        # Handle duplicates
+        counter = 1
+        base_filepath = filepath
+        while filepath.exists():
+            stem = base_filepath.stem
+            filepath = download_dir / f"{stem} ({counter}).{download.format}"
+            counter += 1
+
+        if on_status:
+            on_status(f"  Downloading to: {filename}")
+
+        success = download_file(download.download_url, filepath, on_status)
+
+        if success:
+            return filepath
+        return None
