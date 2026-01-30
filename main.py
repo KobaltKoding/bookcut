@@ -4,7 +4,7 @@ import hashlib
 import shutil
 from pathlib import Path
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Body, BackgroundTasks, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 
@@ -336,6 +336,91 @@ def split_book(book_id: str):
         raise HTTPException(status_code=400, detail="Unsupported EPUB structure")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def process_split_job(job_id: str, epub_path: Path, original_filename: str):
+    """Background task to split an uploaded EPUB and update job status."""
+    import shutil
+    import tempfile
+    
+    try:
+        job_store.update_status(job_id, JobStatus.PROCESSING, "Starting split process...")
+        
+        # Status callback
+        def status_callback(msg):
+             job_store.append_log(job_id, msg)
+             print(f"[{job_id}] {msg}")
+
+        # Create output dir (sibiling to the epub file or a new temp dir)
+        # epub_path is likely in a temp dir already created in the endpoint
+        req_dir = epub_path.parent
+        
+        job_store.update_status(job_id, JobStatus.PROCESSING, "Splitting into chapters...")
+        
+        try:
+             # We can use split_epub_to_markdown directly
+             output_path = split_epub_to_markdown(
+                 epub_path,
+                 req_dir, # Output to same temp dir
+                 on_status=status_callback
+             )
+        except Exception as e:
+             job_store.fail_job(job_id, f"Split failed: {e}")
+             if req_dir.exists():
+                 shutil.rmtree(req_dir)
+             return
+
+        # Zip result
+        job_store.update_status(job_id, JobStatus.PROCESSING, "Zipping result...")
+        
+        safe_name = "".join([c for c in original_filename if c.isalpha() or c.isdigit() or c in (' ', '.', '_')]).strip()
+        zip_base_name = req_dir / f"{safe_name}_chapters"
+        
+        if output_path.is_dir():
+             zip_path = shutil.make_archive(str(zip_base_name), 'zip', output_path)
+        else:
+             job_store.fail_job(job_id, "Unexpected split output format")
+             shutil.rmtree(req_dir)
+             return
+
+        # Complete job
+        job_store.complete_job(job_id, zip_path)
+        
+    except Exception as e:
+        job_store.fail_job(job_id, str(e))
+        if 'req_dir' in locals() and req_dir.exists():
+            shutil.rmtree(req_dir)
+
+
+@app.post("/split-file")
+def split_file(file: UploadFile, background_tasks: BackgroundTasks):
+    """Upload an EPUB file to split asynchronously."""
+    if not file.filename.lower().endswith(".epub"):
+         raise HTTPException(status_code=400, detail="Only EPUB files successfully supported")
+
+    # Create job
+    job_id = job_store.create_job(f"Split: {file.filename}")
+    
+    # Create temp dir for this upload
+    request_id = hashlib.md5((file.filename + str(datetime.now())).encode()).hexdigest()[:8]
+    req_dir = DOWNLOAD_DIR / f"split_{request_id}"
+    req_dir.mkdir(exist_ok=True)
+    
+    epub_path = req_dir / file.filename
+    
+    try:
+        with open(epub_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        shutil.rmtree(req_dir)
+        raise HTTPException(status_code=500, detail=f"File upload failed: {e}")
+    finally:
+        file.file.close()
+
+    # Start background task
+    background_tasks.add_task(process_split_job, job_id, epub_path, file.filename)
+    
+    return {"job_id": job_id, "status": "pending", "message": "Job started"}
 
 @app.post("/grab")
 def grab_book(req: DownloadRequest, background_tasks: BackgroundTasks):
