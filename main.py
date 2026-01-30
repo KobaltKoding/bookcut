@@ -5,14 +5,18 @@ import shutil
 from pathlib import Path
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 
 from bookcut.database import Database, LibraryBook
+from bookcut.jobs import JobStore, JobStatus
 from bookcut.sources import BookFinder
 from bookcut.splitter import split_epub_to_markdown, list_chapters, UnsupportedStructureError
 
 app = FastAPI(title="BookCut API")
+
+# Single global job store (in-memory)
+job_store = JobStore()
 
 # --- Config ---
 env_dir = os.environ.get("BOOKCUT_DIR")
@@ -26,6 +30,68 @@ MARKDOWN_DIR = DOWNLOAD_DIR / "markdown"
 MARKDOWN_DIR.mkdir(parents=True, exist_ok=True)
 
 db = Database()
+
+
+def process_grab_job(job_id: str, query: str, force_epub: bool = True):
+    """Background task to run the grab pipeline and update job status."""
+    import shutil
+    
+    try:
+        job_store.update_status(job_id, JobStatus.PROCESSING, "Starting download process...")
+
+        # Create temp dir
+        request_id = hashlib.md5((query + str(datetime.now())).encode()).hexdigest()[:8]
+        req_dir = DOWNLOAD_DIR / f"grab_{request_id}"
+        req_dir.mkdir(exist_ok=True)
+        
+        # Status callback to update job log
+        def status_callback(msg):
+             job_store.append_log(job_id, msg)
+             print(f"[{job_id}] {msg}")
+
+        from bookcut.lib import BookCutLib
+        lib = BookCutLib(DOWNLOAD_DIR, db)
+        
+        metadata, epub_path, output_path = lib.grab_book(
+            query,
+            on_status=status_callback,
+            force_epub=force_epub,
+            custom_download_dir=req_dir,
+            skip_library_save=True
+        )
+
+        if not metadata:
+             job_store.fail_job(job_id, "Book not found")
+             shutil.rmtree(req_dir)
+             return
+
+        if not epub_path:
+             job_store.fail_job(job_id, "Could not find a splittable EPUB version.")
+             shutil.rmtree(req_dir)
+             return
+
+        if not output_path:
+             job_store.fail_job(job_id, "Split failed (and retries exhausted).")
+             shutil.rmtree(req_dir)
+             return
+             
+        # Zip result
+        job_store.update_status(job_id, JobStatus.PROCESSING, "Zipping result...")
+        zip_base_name = req_dir / "result"
+        if output_path.is_dir():
+             zip_path = shutil.make_archive(str(zip_base_name), 'zip', output_path)
+        else:
+             job_store.fail_job(job_id, "Unexpected split output format")
+             shutil.rmtree(req_dir)
+             return
+
+        # Keep zip, complete job
+        job_store.complete_job(job_id, zip_path)
+        
+    except Exception as e:
+        job_store.fail_job(job_id, str(e))
+        if 'req_dir' in locals() and req_dir.exists():
+            shutil.rmtree(req_dir)
 
 # --- Models ---
 class BookResponse(BaseModel):
@@ -273,76 +339,47 @@ def split_book(book_id: str):
 
 @app.post("/grab")
 def grab_book(req: DownloadRequest, background_tasks: BackgroundTasks):
-    """Download, split, and return a zip of the book chapters."""
+    """Start an async job to download and split a book."""
     if not req.query:
         raise HTTPException(status_code=400, detail="Query required for grab")
 
-    # Tracking paths for cleanup
-    temp_dirs = []
+    # Create job
+    job_id = job_store.create_job(req.query)
     
-    def cleanup_files():
-        for p in temp_dirs:
-            if p.exists():
-                if p.is_dir():
-                    shutil.rmtree(p)
-                else:
-                    p.unlink()
+    # Start background task
+    background_tasks.add_task(process_grab_job, job_id, req.query, force_epub=True)
+    
+    return {"job_id": job_id, "status": "pending", "message": "Job started"}
 
-    try:
-        from bookcut.lib import BookCutLib
-        lib = BookCutLib(DOWNLOAD_DIR, db)
-        
-        # Create a specific temp dir for this request
-        import tempfile
-        request_id = hashlib.md5((req.query + str(datetime.now())).encode()).hexdigest()[:8]
-        req_dir = DOWNLOAD_DIR / f"grab_{request_id}"
-        req_dir.mkdir(exist_ok=True)
-        temp_dirs.append(req_dir)
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str):
+    job = job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "created_at": job.created_at,
+        "query": job.query,
+        "message": job.message,
+        "error": job.error
+    }
 
-        # Use BookCutLib
-        metadata, epub_path, output_path = lib.grab_book(
-            req.query,
-            on_status=print, 
-            force_epub=True,
-            custom_download_dir=req_dir,
-            skip_library_save=True
-        )
+@app.get("/jobs/{job_id}/download")
+def download_job_result(job_id: str):
+    job = job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Job not completed yet")
+    
+    if not job.result_path or not os.path.exists(job.result_path):
+        raise HTTPException(status_code=500, detail="Result file missing")
         
-        if not metadata:
-             raise HTTPException(status_code=404, detail="Book not found")
-             
-        if not epub_path:
-             cleanup_files()
-             raise HTTPException(status_code=404, detail="Could not find an SPLITTABLE EPUB version of this book.")
-             
-        if not output_path:
-             cleanup_files()
-             raise HTTPException(status_code=500, detail="Split failed (and retries exhausted).")
-
-        # 3. Zip
-        zip_base_name = req_dir / "result"
-        if output_path.is_dir():
-             zip_path = shutil.make_archive(str(zip_base_name), 'zip', output_path)
-        else:
-             cleanup_files()
-             raise HTTPException(status_code=500, detail="Unexpected split output format")
-             
-        temp_dirs.append(Path(zip_path))
-        
-        # 4. Return
-        filename = f"{metadata.title}_chapters.zip"
-        filename = "".join([c for c in filename if c.isalpha() or c.isdigit() or c in (' ', '.', '_')]).strip()
-        
-        background_tasks.add_task(cleanup_files)
-        
-        return FileResponse(zip_path, filename=filename, media_type="application/zip")
-
-    except HTTPException:
-        cleanup_files()
-        raise
-    except Exception as e:
-        cleanup_files()
-        raise HTTPException(status_code=500, detail=str(e))
+    filename = Path(job.result_path).name
+    return FileResponse(job.result_path, filename=filename, media_type="application/zip")
 
 @app.get("/files/{book_id}")
 def get_book_file(book_id: str):
