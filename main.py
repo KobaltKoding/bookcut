@@ -1,6 +1,7 @@
 from datetime import datetime
 import os
 import hashlib
+import shutil
 from pathlib import Path
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
@@ -270,11 +271,84 @@ def split_book(book_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/grab")
+def grab_book(req: DownloadRequest, background_tasks: BackgroundTasks):
+    """Download, split, and return a zip of the book chapters."""
+    if not req.query:
+        raise HTTPException(status_code=400, detail="Query required for grab")
+
+    # Tracking paths for cleanup
+    temp_dirs = []
+    
+    def cleanup_files():
+        for p in temp_dirs:
+            if p.exists():
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+
+    try:
+        from bookcut.lib import BookCutLib
+        lib = BookCutLib(DOWNLOAD_DIR, db)
+        
+        # Create a specific temp dir for this request
+        import tempfile
+        request_id = hashlib.md5((req.query + str(datetime.now())).encode()).hexdigest()[:8]
+        req_dir = DOWNLOAD_DIR / f"grab_{request_id}"
+        req_dir.mkdir(exist_ok=True)
+        temp_dirs.append(req_dir)
+
+        # Use BookCutLib
+        metadata, epub_path, output_path = lib.grab_book(
+            req.query,
+            on_status=print, 
+            force_epub=True,
+            custom_download_dir=req_dir,
+            skip_library_save=True
+        )
+        
+        if not metadata:
+             raise HTTPException(status_code=404, detail="Book not found")
+             
+        if not epub_path:
+             cleanup_files()
+             raise HTTPException(status_code=404, detail="Could not find an SPLITTABLE EPUB version of this book.")
+             
+        if not output_path:
+             cleanup_files()
+             raise HTTPException(status_code=500, detail="Split failed (and retries exhausted).")
+
+        # 3. Zip
+        zip_base_name = req_dir / "result"
+        if output_path.is_dir():
+             zip_path = shutil.make_archive(str(zip_base_name), 'zip', output_path)
+        else:
+             cleanup_files()
+             raise HTTPException(status_code=500, detail="Unexpected split output format")
+             
+        temp_dirs.append(Path(zip_path))
+        
+        # 4. Return
+        filename = f"{metadata.title}_chapters.zip"
+        filename = "".join([c for c in filename if c.isalpha() or c.isdigit() or c in (' ', '.', '_')]).strip()
+        
+        background_tasks.add_task(cleanup_files)
+        
+        return FileResponse(zip_path, filename=filename, media_type="application/zip")
+
+    except HTTPException:
+        cleanup_files()
+        raise
+    except Exception as e:
+        cleanup_files()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/files/{book_id}")
 def get_book_file(book_id: str):
     book = db.get_book(book_id)
     if not book:
-         raise HTTPException(status_code=404, detail="Book not found")
+        raise HTTPException(status_code=404, detail="Book not found")
     
     path = Path(book.file_path)
     if not path.exists():

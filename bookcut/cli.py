@@ -131,87 +131,7 @@ def _display_chapters(entries: list[dict]) -> None:
     console.print(f"\n[dim]{ch_count} chapter(s), {sec_count} section(s)[/dim]\n")
 
 
-def _retry_split_with_alternate_epub(
-    book_title: str,
-    failed_epub_path: Path,
-    on_status,
-    max_retries: int = 3,
-) -> Path | None:
-    """Try downloading alternate EPUB editions and splitting them.
 
-    Returns the output path on success, None if all attempts fail.
-    """
-    from bookcut.sources import download_file
-
-    on_status(f"Searching for alternate EPUB editions of '{book_title}'...")
-
-    with BookFinder() as finder:
-        metadata, isbns = finder.collect_isbns(book_title, on_status=on_status)
-
-        if not metadata:
-            return None
-
-        attempts = 0
-        for i, isbn in enumerate(isbns):
-            if attempts >= max_retries:
-                on_status(f"Exhausted {max_retries} retry attempts.")
-                break
-
-            on_status(f"Trying ISBN {i+1}/{len(isbns)}: {isbn}")
-
-            dl = finder.find_download_by_isbn(isbn, expected_title=metadata.title, on_status=on_status)
-            if not dl or dl.format.lower() != "epub":
-                continue
-
-            # Download to a temp file
-            alt_epub = _download_dir / f"_alt_{isbn}.epub"
-            on_status(f"  Downloading alternate EPUB...")
-            success = download_file(dl.download_url, alt_epub, on_status)
-            if not success:
-                continue
-
-            # Skip if same file size as the failed one
-            if (failed_epub_path.exists() and alt_epub.exists()
-                    and alt_epub.stat().st_size == failed_epub_path.stat().st_size):
-                on_status("  Same file as original, skipping...")
-                alt_epub.unlink()
-                continue
-
-            attempts += 1
-            on_status(f"  Attempting split (retry {attempts}/{max_retries})...")
-
-            try:
-                output_path = split_epub_to_markdown(
-                    alt_epub,
-                    _markdown_dir,
-                    on_status=on_status,
-                )
-                # Success — clean up the alt epub
-                alt_epub.unlink(missing_ok=True)
-
-                # Move output to the original book name if different
-                expected_output = _markdown_dir / failed_epub_path.stem
-                if output_path != expected_output and output_path.exists():
-                    if expected_output.exists():
-                        shutil.rmtree(expected_output)
-                    shutil.move(str(output_path), str(expected_output))
-                    output_path = expected_output
-
-                return output_path
-            except UnsupportedStructureError:
-                on_status("  This edition also has unsupported structure.")
-                alt_epub.unlink(missing_ok=True)
-                # Clean up failed output
-                alt_output = _markdown_dir / alt_epub.stem
-                if alt_output.exists():
-                    shutil.rmtree(alt_output)
-                continue
-            except SplitterError as e:
-                on_status(f"  Split failed: {e}")
-                alt_epub.unlink(missing_ok=True)
-                continue
-
-    return None
 
 
 # === Commands ===
@@ -544,124 +464,37 @@ def grab(
     def status_callback(msg: str):
         console.print(f"[dim]{msg}[/dim]")
 
-    # --- Phase 1: Download EPUB ---
-    console.print("[bold]Phase 1: Downloading EPUB...[/bold]\n")
+    from bookcut.lib import BookCutLib
+    lib = BookCutLib(_download_dir, _db)
+    
+    metadata, epub_path, output_path = lib.grab_book(
+        query, 
+        on_status=status_callback,
+        force_epub=True,
+    )
 
-    with BookFinder() as finder:
-        metadata, isbns = finder.collect_isbns(query, on_status=status_callback)
+    if not metadata:
+        console.print("[yellow]No book found matching your query.[/yellow]")
+        raise typer.Exit(0)
 
-        if not metadata:
-            console.print("[yellow]No book found matching your query.[/yellow]")
-            raise typer.Exit(0)
-
-        status_callback(f"\nFound book: {metadata.title}")
-        if metadata.author:
-            status_callback(f"Author: {metadata.author}")
-
-        # Try to find and download an EPUB specifically
-        epub_download = None
-        epub_filepath = None
-
-        if isbns:
-            status_callback(f"\nTrying {len(isbns)} ISBN(s) for EPUB download...")
-
-            for i, isbn in enumerate(isbns):
-                status_callback(f"Trying ISBN {i+1}/{len(isbns)}: {isbn}")
-
-                dl = finder.find_download_by_isbn(isbn, expected_title=metadata.title, on_status=status_callback)
-                if not dl:
-                    continue
-
-                # Prefer EPUB, but accept others
-                if dl.format.lower() != "epub":
-                    # Check if there are epub alternatives for this ISBN
-                    all_downloads = []
-                    for source in finder.download_sources:
-                        try:
-                            all_downloads.extend(source.find_download(isbn))
-                        except Exception:
-                            continue
-                    epub_options = [d for d in sort_by_format(all_downloads)
-                                   if d.format.lower() == "epub"]
-                    if epub_options:
-                        dl = epub_options[0]
-                        status_callback(f"  Found EPUB version!")
-                    else:
-                        status_callback(f"  Only {dl.format.upper()} available, skipping (need EPUB for split)...")
-                        continue
-
-                dl.isbn = isbn
-
-                filepath = finder._attempt_download(dl, metadata, _download_dir, on_status=status_callback)
-                if filepath:
-                    epub_download = dl
-                    epub_filepath = filepath
-                    break
-                else:
-                    status_callback("  Download failed, trying next ISBN...")
-
-        # Fallback: title search
-        if not epub_filepath:
-            status_callback("\nFalling back to title search...")
-            dl = finder.find_download_by_title(metadata.title, metadata.author, on_status=status_callback)
-            if dl and dl.format.lower() == "epub":
-                filepath = finder._attempt_download(dl, metadata, _download_dir, on_status=status_callback)
-                if filepath:
-                    epub_download = dl
-                    epub_filepath = filepath
-
-    if not epub_download or not epub_filepath:
+    if not epub_path:
         console.print(f"\n[yellow]Could not find an EPUB download for '{metadata.title}'.[/yellow]")
         console.print("[dim]Try 'bookcut get' to download in any format.[/dim]")
         raise typer.Exit(1)
 
-    # Save to library
-    book_id = _save_to_library(metadata, epub_download, epub_filepath)
-
-    console.print(f"\n[green]Download complete![/green]")
-    console.print(f"[dim]Saved to: {epub_filepath}[/dim]\n")
-
-    # --- Phase 2: Split ---
-    console.print("[bold]Phase 2: Splitting into chapters...[/bold]\n")
-
-    output_path = _do_split(epub_filepath, metadata.title)
     if output_path is None:
         console.print("[yellow]Split failed. The book was downloaded but could not be split.[/yellow]")
-        console.print(f"[dim]Book ID: {book_id}[/dim]")
         raise typer.Exit(1)
 
     entries = list_chapters(output_path)
 
     console.print(f"\n[green]Done! Book downloaded and split.[/green]")
-    console.print(f"[dim]EPUB: {epub_filepath}[/dim]")
+    console.print(f"[dim]EPUB: {epub_path}[/dim]")
     console.print(f"[dim]Chapters: {output_path}[/dim]\n")
     _display_chapters(entries)
 
 
-def _do_split(epub_path: Path, book_title: str) -> Path | None:
-    """Attempt to split an EPUB, retrying with alternate editions on unsupported structure.
 
-    Returns output path on success, None on failure.
-    """
-    def status_callback(msg: str):
-        console.print(f"[dim]{msg}[/dim]")
-
-    try:
-        return split_epub_to_markdown(
-            epub_path,
-            _markdown_dir,
-            on_status=status_callback,
-        )
-    except UnsupportedStructureError:
-        console.print(f"\n[yellow]EPUB has unsupported structure. Trying alternate editions...[/yellow]\n")
-
-        result = _retry_split_with_alternate_epub(book_title, epub_path, status_callback)
-        if result is None:
-            console.print("[red]Could not find a compatible EPUB edition.[/red]")
-        return result
-    except SplitterError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        return None
 
 
 if __name__ == "__main__":
