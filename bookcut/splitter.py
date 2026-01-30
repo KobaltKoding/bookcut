@@ -36,17 +36,22 @@ _CHAPTER_PATTERNS = [
     re.compile(r"^\d+\._"),
     # N_Title (bare number, e.g. "1_The_Challenge_of_the_Future")
     re.compile(r"^\d+_[A-Z]"),
+    # N__Title (e.g. "1__The_Surprising_Power")
+    re.compile(r"^\d+__"),
 ]
 
 _PART_HEADER_PATTERNS = [
     re.compile(r"^Part_", re.IGNORECASE),
     re.compile(r"^PART_"),
+    re.compile(r"^The_\w+_Law__", re.IGNORECASE),
+    re.compile(r"^The_Fundamentals__", re.IGNORECASE),
+    re.compile(r"^Advanced_Tactics__", re.IGNORECASE),
 ]
 
 _CONTENT_SECTION_NAMES = {
     "introduction", "preface", "foreword", "prologue",
     "afterword", "epilogue", "postscriptum",
-    "conclusion", "timeline", "glossary",
+    "conclusion", "timeline", "glossary", "appendix",
 }
 
 _DISCARD_NAMES = {
@@ -116,12 +121,19 @@ def _classify(name: str, file_size: int) -> str:
     return "unknown"
 
 
+def _normalize_quotes(text: str) -> str:
+    """Decode HTML entities and replace curly/smart quotes with straight quotes."""
+    import html
+    text = html.unescape(text)
+    return text.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'").replace("\u2014", "-")
+
+
 def _extract_chapter_title(name: str) -> str:
     """Extract a clean chapter title from the raw filename part."""
     # Chapter_N__Title → Title
     m = re.match(r"^Chapter_\w+__(.+)$", name, re.IGNORECASE)
     if m:
-        return m.group(1).replace("_", " ")
+        return _normalize_quotes(m.group(1).replace("_", " "))
 
     # Chapter_N → Chapter N
     m = re.match(r"^Chapter_(\d+)$", name, re.IGNORECASE)
@@ -133,17 +145,22 @@ def _extract_chapter_title(name: str) -> str:
     if m:
         return f"Chapter {m.group(1).replace('_', ' ')}"
 
+    # N__Title → Title (e.g. "1__The_Surprising_Power")
+    m = re.match(r"^\d+__(.+)$", name)
+    if m:
+        return _normalize_quotes(m.group(1).replace("_", " "))
+
     # N._Title → Title
     m = re.match(r"^\d+\._(.+)$", name)
     if m:
-        return m.group(1).replace("_", " ")
+        return _normalize_quotes(m.group(1).replace("_", " "))
 
     # N_Title → Title
     m = re.match(r"^\d+_(.+)$", name)
     if m:
-        return m.group(1).replace("_", " ")
+        return _normalize_quotes(m.group(1).replace("_", " "))
 
-    return name.replace("_", " ")
+    return _normalize_quotes(name.replace("_", " "))
 
 
 def _extract_section_title(name: str) -> str:
@@ -152,8 +169,8 @@ def _extract_section_title(name: str) -> str:
     base = parts[0].replace("_", " ")
     if len(parts) == 2:
         subtitle = parts[1].replace("_", " ")
-        return f"{base} - {subtitle}"
-    return base
+        return _normalize_quotes(f"{base} - {subtitle}")
+    return _normalize_quotes(base)
 
 
 def classify_and_organize(
@@ -371,10 +388,10 @@ def list_chapters(markdown_dir: Path) -> list[dict]:
             m = re.match(r"^chapter_(\d+)_(.+)$", name)
             if m:
                 number = int(m.group(1))
-                chapter_name = m.group(2).replace("_", " ")
+                chapter_name = _normalize_quotes(m.group(2).replace("_", " "))
             else:
                 number = 0
-                chapter_name = name.replace("_", " ")
+                chapter_name = _normalize_quotes(name.replace("_", " "))
             entries.append({
                 "number": number,
                 "name": chapter_name,
@@ -383,7 +400,7 @@ def list_chapters(markdown_dir: Path) -> list[dict]:
                 "type": "chapter",
             })
         elif name.startswith("section_"):
-            section_name = name[8:].replace("_", " ").title()
+            section_name = _normalize_quotes(name[8:].replace("_", " ").title())
             entries.append({
                 "number": 0,
                 "name": f"[{section_name}]",

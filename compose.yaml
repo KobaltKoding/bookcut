@@ -1,0 +1,9 @@
+services:
+  bookcut:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      - BOOKCUT_DIR=/data

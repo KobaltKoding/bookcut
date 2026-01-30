@@ -24,10 +24,17 @@ app = typer.Typer(
 )
 console = Console()
 
-_download_dir = Path.home() / "BookCut"
-_download_dir.mkdir(exist_ok=True)
+import os
+
+env_dir = os.environ.get("BOOKCUT_DIR")
+if env_dir:
+    _download_dir = Path(env_dir)
+else:
+    _download_dir = Path.home() / "BookCut"
+
+_download_dir.mkdir(exist_ok=True, parents=True)
 _markdown_dir = _download_dir / "markdown"
-_db = Database(_download_dir / "library.db")
+_db = Database() # Database class now handles the path internaly based on env var or default
 
 
 def _truncate(text: str | None, length: int = 40) -> str:

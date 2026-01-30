@@ -27,7 +27,12 @@ class Database:
     """SQLite database for managing downloaded books."""
 
     def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or Path.home() / "BookCut" / "library.db"
+        import os
+        base_dir = os.environ.get("BOOKCUT_DIR")
+        if base_dir:
+            self.db_path = db_path or Path(base_dir) / "library.db"
+        else:
+            self.db_path = db_path or Path.home() / "BookCut" / "library.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
