@@ -257,8 +257,8 @@ class BookCutLib:
                 custom_output_dir,
                 on_status=on_status,
             )
-        except UnsupportedStructureError:
-            on_status(f"\n[yellow]EPUB has unsupported structure. Trying alternate editions...[/yellow]\n")
+        except (UnsupportedStructureError, SplitterError) as e:
+            on_status(f"\n[yellow]Split failed ({str(e)}). Trying alternate editions...[/yellow]\n")
             
             # For retry, we need to pass the custom_output_dir if set
             result = self.retry_split_with_alternate_epub(
@@ -270,6 +270,3 @@ class BookCutLib:
             if result is None:
                 on_status("[red]Could not find a compatible EPUB edition.[/red]")
             return result
-        except SplitterError as e:
-            on_status(f"[red]Error:[/red] {e}")
-            return None
